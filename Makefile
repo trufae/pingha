@@ -1,9 +1,12 @@
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: all install uninstall user-install user-uninstall
+.PHONY: all test install uninstall user-install user-uninstall
 
 all:
+
+test:
+	python3 test_pingha.py
 
 user-install:
 	$(MAKE) install PREFIX=$${HOME}/.local

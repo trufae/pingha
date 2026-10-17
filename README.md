@@ -1,108 +1,76 @@
-# pingha
+# 👃 pingha
 
-A tiny, pure-POSIX-shell tool that keeps the GitHub Actions in your workflows pinned to immutable commit SHAs.
-
-## Why pinning matters
-
-GitHub Actions are usually referenced by a moving tag:
-
-```yaml
-- uses: actions/checkout@v4
-```
-
-That is convenient, but a tag is only a pointer. The owner of the action — or anyone who compromises their account — can move `v4` to a different commit at any time. The next time your workflow runs it may execute code you never reviewed, with full access to your repository secrets and CI environment.
-
-Pinning replaces the tag with the full commit SHA and keeps the version as a comment:
-
-```yaml
-- uses: actions/checkout@11bd71901bbe5b1630ceea73d2752379e6975d27 # v4
-```
-
-Because a SHA cannot be repointed, this guarantees that the exact same code runs every time. The comment makes it easy for humans to see which semantic version the SHA corresponds to.
-
-## How it works
-
-1. `pingha --pin` reads every `.yml`/`.yaml` file in `.github/workflows`.
-2. For each `uses: owner/repo@<tag>` line that is not already a SHA, it asks the GitHub API what commit that tag currently points to.
-3. It rewrites the line to `uses: owner/repo@<sha> # <tag>`.
-4. If a newer tag is available, it prints a suggestion but does not change the tag unless you use `--update`.
-5. `pingha --update` moves every action to the latest published tag and pins it.
-6. `pingha --dependabot` creates `.github/dependabot.yml` so Dependabot can open PRs when actions have new releases.
+A small POSIX-shell tool for pinning, updating and inspecting GitHub Actions.
+Requires **jq** and **curl**, checked before any work starts.
 
 ## Installation
 
-Copy the `pingha` script somewhere on your `$PATH` and make it executable:
-
 ```sh
-chmod +x pingha
-cp pingha ~/bin/
+make user-install            # installs to ~/.local/bin
+# or: make install PREFIX=/usr/local
 ```
-
-The only runtime dependencies are POSIX shell utilities plus `curl` and `sed`.
 
 ## Usage
 
-```sh
-# Pin all unpinned actions in place
-pingha --pin
-
-# Update every action to its latest tag and pin it
-pingha --update
-
-# Add Dependabot for GitHub Actions
-pingha --dependabot
-```
-
-For private repositories or to avoid API rate limits, set a token:
+Run from the repository root:
 
 ```sh
-GITHUB_TOKEN=ghp_... pingha --update
+pingha -p                   # pin each action to its current ref's commit
+pingha -u                   # update and pin to the latest tag returned by GitHub
+pingha -i                   # inspect current versions and update status
+pingha -d                   # create Dependabot configuration if none exists
+pingha -u -i                # update, then inspect using the same cache
 ```
 
-## Example
+Long options are `--pin`, `--update`, `--info`, `--dependabot`, and `--help`.
+All options are validated before changes are made.
 
-Before:
+`--info` prints one row per distinct action/reference, with these columns:
 
-```yaml
-- uses: actions/checkout@v4
-- uses: actions/setup-python@v5
+```text
+ACTION                 CURRENT             PIN        NEXT
+actions/checkout       <sha> # v4           pinned     update to v5
+actions/setup-python   v6                  unpinned   up to date
 ```
 
-After `pingha --pin`:
+Pinned references are green and unpinned references are red in terminals.
+`NO_COLOR` disables colors; `CLICOLOR_FORCE=1` enables them when redirecting output.
+Pin status and update status are independent: an unpinned tag can be up to date.
+Update status compares commit SHAs, so equivalent tags do not cause false updates.
+Failed lookups show `unknown` and return a nonzero exit status.
+
+Every GitHub API response, including failures, is cached **for one invocation**.
+Repeated actions and subdirectories in the same repository share the cache,
+including across combined options. Temporary cache files are removed on exit;
+the next invocation fetches fresh data. Rate-limit responses stop further requests.
+Use `GITHUB_TOKEN` for private repositories or higher API limits:
+
+```sh
+GITHUB_TOKEN=ghp_... pingha -i
+```
+
+The tool reads `.yml` and `.yaml` files directly in `.github/workflows`.
+It supports ordinary scalar `uses:` entries, including quoted references,
+subdirectory actions and reusable workflows. Local and Docker actions, comments,
+and YAML block strings are skipped. Flow-style mappings and YAML aliases are not
+processed. Quotes, explanatory comments, CRLF endings and file permissions are
+preserved. Existing Dependabot configurations are left intact.
+
+Pinning replaces a movable tag with an immutable commit and a version comment:
 
 ```yaml
 - uses: actions/checkout@11bd71901bbe5b1630ceea73d2752379e6975d27 # v4
-- uses: actions/setup-python@0d5eda585c54a7394d25d1cd71e2e9df3ddb5f9c # v5
 ```
 
-After `pingha --update`:
+`--update` follows the first tag in GitHub's repository tags endpoint, as before;
+it does not filter prereleases or restrict major-version upgrades. Review changes
+before committing them.
 
-```yaml
-- uses: actions/checkout@<latest-sha> # v5
-- uses: actions/setup-python@<latest-sha> # v6
-```
+## Tests
 
-## Dependabot integration
-
-`pingha --dependabot` writes the following file and reminds you to commit it:
-
-```yaml
-# .github/dependabot.yml
-version: 2
-updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    commit-message:
-      prefix: "actions"
-    labels:
-      - "dependencies"
-      - "github-actions"
-```
-
-Dependabot will then open pull requests when your pinned actions have newer releases.
+`make test` runs offline regression tests using Python 3 and a fake GitHub API.
+Use `PINGHA_TEST_SHELL=/bin/dash make test` to exercise another POSIX shell.
 
 ## License
 
-Public domain / CC0 — do whatever you want.
+Public domain / CC0.
