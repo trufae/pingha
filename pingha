@@ -1,0 +1,238 @@
+#!/bin/sh
+# pingha - GitHub Actions pin/update tool (POSIX shell)
+# Usage: pingha [-p|--pin] [-u|--update] [-d|--dependabot] [-h|--help]
+
+set -e
+
+# --- helpers ---------------------------------------------------------------
+
+RED=$(printf '\033[0;31m')
+GREEN=$(printf '\033[0;32m')
+YELLOW=$(printf '\033[0;33m')
+BLUE=$(printf '\033[0;34m')
+NC=$(printf '\033[0m')
+
+usage() {
+    cat <<EOF
+Usage: pingha [options]
+
+Options:
+  -p, --pin          Pin every unpinned GitHub Action to its current tag's
+                     commit SHA (keeps the tag as a comment).
+  -u, --update       Update every GitHub Action to the latest published tag
+                     and pin it with SHA + tag comment.
+  -d, --dependabot   Create .github/dependabot.yml for GitHub Actions and
+                     remind you to git add+commit it.
+  -h, --help         Show this help.
+
+Environment:
+  GITHUB_TOKEN       Personal access token. Raises API rate limits.
+
+Examples:
+  pingha --pin
+  pingha --update
+  pingha --dependabot
+EOF
+    exit 0
+}
+
+die() { printf "%s%s%s\n" "$RED" "$1" "$NC" >&2; exit 1; }
+info() { printf "%s[+]%s %s\n" "$GREEN" "$NC" "$1"; }
+warn() { printf "%s[!]%s %s\n" "$YELLOW" "$NC" "$1"; }
+err() { printf "%s[-]%s %s\n" "$RED" "$NC" "$1" >&2; }
+
+api_curl() {
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$1"
+    else
+        curl -fsSL "$1"
+    fi
+}
+
+# Extract first top-level "field": "value" value from JSON.
+json_get() {
+    field=$1
+    awk -F'"' '/"'"$field"'":/ { print $4; exit }'
+}
+
+# Get the SHA a tag currently points to via the GitHub API.
+sha_for_tag() {
+    owner_repo=$1
+    tag=$2
+    resp=$(api_curl "https://api.github.com/repos/$owner_repo/commits/$tag" 2>/dev/null) || return 1
+    printf '%s\n' "$resp" | json_get sha
+}
+
+# Get the latest published tag name + its commit SHA for a repo.
+latest_tag() {
+    owner_repo=$1
+    resp=$(api_curl "https://api.github.com/repos/$owner_repo/tags?per_page=1" 2>/dev/null) || return 1
+    tag=$(printf '%s\n' "$resp" | json_get name)
+    sha=$(printf '%s\n' "$resp" | awk -F'"' '
+        /"commit":/ { in_commit=1 }
+        in_commit && /"sha":/ { print $4; exit }
+    ')
+    if [ -n "$tag" ] && [ -n "$sha" ]; then
+        printf '%s %s\n' "$sha" "$tag"
+    else
+        return 1
+    fi
+}
+
+# Parse the action reference from a workflow line, without any trailing comment.
+action_from_line() {
+    printf '%s\n' "$1" | sed -e 's/.*uses: *//' -e 's/ *#.*//' -e "s/^['\"]*//" -e "s/['\"]*$//" -e 's/ *$//'
+}
+
+# Parse the full action token, including an existing version comment.
+full_action_from_line() {
+    printf '%s\n' "$1" | sed -e 's/.*uses: *//' -e "s/^['\"]*//" -e "s/['\"]*$//" -e 's/ *$//'
+}
+
+# True if the reference is already pinned to a 40-char hex SHA.
+is_pinned() {
+    ref=$1
+    ref_tag=$(printf '%s\n' "$ref" | sed 's/.*@//')
+    printf '%s\n' "$ref_tag" | grep -Eq '^[a-f0-9]{40}$'
+}
+
+# Replace action reference in one workflow file. Uses POSIX-safe temp file.
+replace_action() {
+    file=$1
+    old=$2
+    new=$3
+    tmp="${file}.tmp.$$"
+    sed "s|$old|$new|" "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# Walk workflow files and execute callback for each action reference.
+walk_workflows() {
+    callback=$1
+    if [ ! -d .github/workflows ]; then
+        warn "No .github/workflows directory found."
+        return 0
+    fi
+    find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | while IFS= read -r file; do
+        # Process every 'uses:' line.
+        grep -E '^ *-? *uses: ' "$file" | while IFS= read -r line; do
+            action=$(action_from_line "$line")
+            # Ignore docker/local references and already complete pins?
+            case "$action" in
+                docker://*) continue ;;
+                ./*|.\/*) continue ;;
+            esac
+            full=$(full_action_from_line "$line")
+            "$callback" "$file" "$line" "$action" "$full"
+        done
+    done
+}
+
+# --- subcommands -----------------------------------------------------------
+
+pin_one() {
+    file=$1
+    line=$2
+    action=$3
+    full=$4
+
+    if is_pinned "$action"; then
+        return 0
+    fi
+
+    repo=$(printf '%s\n' "$action" | sed 's/@.*//')
+    tag=$(printf '%s\n' "$action" | sed 's/.*@//')
+
+    warn "Unpinned action: $action  ($file)"
+    sha=$(sha_for_tag "$repo" "$tag") || {
+        err "Could not resolve $repo@$tag"
+        return 0
+    }
+
+    new="$repo@$sha # $tag"
+    info "Pinning to $new"
+    replace_action "$file" "$full" "$new"
+
+    # Also suggest if a newer tag exists.
+    latest=$(latest_tag "$repo" 2>/dev/null) || return 0
+    latest_sha=$(printf '%s\n' "$latest" | awk '{print $1}')
+    latest_tag_name=$(printf '%s\n' "$latest" | awk '{print $2}')
+    if [ "$latest_tag_name" != "$tag" ]; then
+        printf '%s->%s newer tag available: %s (run pingha --update)\n' "$BLUE" "$NC" "$latest_tag_name"
+    fi
+}
+
+update_one() {
+    file=$1
+    line=$2
+    action=$3
+    full=$4
+
+    repo=$(printf '%s\n' "$action" | sed 's/@.*//')
+    cur=$(printf '%s\n' "$action" | sed 's/.*@//')
+
+    latest=$(latest_tag "$repo") || {
+        err "Could not fetch latest tag for $repo"
+        return 0
+    }
+    sha=$(printf '%s\n' "$latest" | awk '{print $1}')
+    tag=$(printf '%s\n' "$latest" | awk '{print $2}')
+
+    new="$repo@$sha # $tag"
+    if [ "$full" = "$new" ]; then
+        info "$repo is already up to date ($tag)"
+        return 0
+    fi
+
+    if is_pinned "$action"; then
+        info "Updating pinned $repo from $cur to $tag ($sha)"
+    else
+        info "Updating $repo from $cur to $tag ($sha)"
+    fi
+    replace_action "$file" "$full" "$new"
+}
+
+pin_actions() {
+    info "Scanning workflow files for unpinned actions..."
+    walk_workflows pin_one
+}
+
+update_actions() {
+    info "Updating all GitHub Actions to their latest tags..."
+    walk_workflows update_one
+}
+
+install_dependabot() {
+    info "Installing Dependabot configuration..."
+    mkdir -p .github
+    cat <<EOF > .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "actions"
+    labels:
+      - "dependencies"
+      - "github-actions"
+EOF
+    info "Wrote .github/dependabot.yml"
+    warn "Now run:  git add .github/dependabot.yml && git commit -m 'Add Dependabot config for GitHub Actions'"
+}
+
+# --- main ------------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--pin)      pin_actions ; shift ;;
+        -u|--update)   update_actions ; shift ;;
+        -d|--dependabot) install_dependabot ; shift ;;
+        -h|--help)     usage ;;
+        *)             die "Unknown option: $1" ;;
+    esac
+done
