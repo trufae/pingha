@@ -48,10 +48,14 @@ incoming commits with authors and full messages, and a full repository diff
 SHA, not the tag in their comment. Unpinned tags and branches are resolved to
 their current SHA; they cannot reveal where a movable tag pointed in the past.
 Repeated actions and subdirectories sharing a commit range are reviewed once.
+In terminals, review headings are cyan, warnings are yellow, and Git highlights
+commits and diff additions/deletions. Review also honors `NO_COLOR` and
+`CLICOLOR_FORCE`; redirected reports stay plain by default.
 
 ```sh
 pingha --review > review.txt # read-only report; check the exit status for failures
 pingha --review --update    # print the review, then apply the reviewed versions
+CLICOLOR_FORCE=1 pingha --review | less -R # browse with colors
 ```
 
 Review always runs before other modes, regardless of option order. Failed

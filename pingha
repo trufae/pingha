@@ -11,7 +11,8 @@ Usage: pingha [options]
   -r, --review       Show all commits and the full diff to the latest tag.
   -d, --dependabot   Create a GitHub Actions Dependabot configuration.
   -h, --help         Show this help.
-Environment: GITHUB_TOKEN (GitHub authentication), NO_COLOR (disable colors).
+Environment: GITHUB_TOKEN (GitHub authentication), NO_COLOR (disable colors),
+             CLICOLOR_FORCE=1 (force colors when piping).
 Lookups, including failures, are cached for the duration of each invocation.
 Review requires git, runs before other modes, and does not change workflows.
 When combined with --update, a failed review prevents updates.
@@ -44,9 +45,10 @@ cache=$(mktemp -d "${TMPDIR:-/tmp}/pingha.XXXXXXXX")
 pending=
 trap 'rm -rf "$cache"; [ -z "$pending" ] || rm -f "$pending"' 0
 trap 'exit 1' HUP INT TERM
-red= green= reset=
+red= green= yellow= cyan= reset= git_color=never
 if [ -z "${NO_COLOR+x}" ] && { [ -t 1 ] || [ "${CLICOLOR_FORCE:-0}" != 0 ]; }; then
     red=$(printf '\033[31m'); green=$(printf '\033[32m'); reset=$(printf '\033[0m')
+    yellow=$(printf '\033[33m'); cyan=$(printf '\033[1;36m'); git_color=always
 fi
 
 cache_entry() (
@@ -133,14 +135,14 @@ EOF
         :
     else
         status=$?; [ "$status" -eq 1 ] || return 1
-        printf '\nWARNING: latest tag does not descend from the current commit.\n'
-        printf 'Commits removed from the current history:\n'
-        review_git log --reverse --topo-order --format=fuller --no-notes "$3..$2" -- || return 1
+        printf '\n%sWARNING: latest tag does not descend from the current commit.%s\n' "$yellow" "$reset"
+        printf '%sCommits removed from the current history:%s\n' "$cyan" "$reset"
+        review_git log --color="$git_color" --reverse --topo-order --format=fuller --no-notes "$3..$2" -- || return 1
     fi
-    printf '\nCommits added since the current reference:\n'
-    review_git log --reverse --topo-order --format=fuller --no-notes "$2..$3" -- || return 1
-    printf '\nFull diff (current commit -> latest tag):\n'
-    review_git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none \
+    printf '\n%sCommits added since the current reference:%s\n' "$cyan" "$reset"
+    review_git log --color="$git_color" --reverse --topo-order --format=fuller --no-notes "$2..$3" -- || return 1
+    printf '\n%sFull diff (current commit -> latest tag):%s\n' "$cyan" "$reset"
+    review_git diff --color="$git_color" --no-ext-diff --no-textconv --no-renames --ignore-submodules=none \
         --binary --full-index --stat --patch "$2" "$3" -- || return 1
     touch "$range.done"
 )
@@ -217,11 +219,11 @@ for mode in $modes; do
                     next="update to $tag"; [ "$current" != "$sha" ] || next='up to date'
                     [ "$current" != unknown ] || next=unknown
                     if [ "$mode" = review ]; then
-                        printf '\nReview: %s -> %s (%s)\n' "$action${comment:+ $comment}" "$tag" "$sha"
+                        printf '\n%sReview: %s -> %s (%s)%s\n' "$cyan" "$action${comment:+ $comment}" "$tag" "$sha" "$reset"
                         if [ "$current" = unknown ]; then
-                            printf 'Review unavailable: could not resolve the current reference.\n'
+                            printf '%sReview unavailable: could not resolve the current reference.%s\n' "$red" "$reset"
                         elif [ "$current" = "$sha" ]; then
-                            printf 'Up to date; no changes.\n'
+                            printf '%sUp to date; no changes.%s\n' "$green" "$reset"
                         elif ! review "$repo" "$current" "$sha"; then
                             printf 'pingha: incomplete review for %s (%s -> %s)\n' "$repo" "$current" "$sha" >&2
                             touch "$cache/failed"
