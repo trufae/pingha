@@ -23,6 +23,27 @@ if response is None:
 pathlib.Path(args[args.index('-o') + 1]).write_text(json.dumps(response[1]))
 print(response[0], end='')
 '''
+GIT = '''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+if 'diff' in args and os.environ.get('FAIL_DIFF'):
+    sys.exit(1)
+for i, arg in enumerate(args):
+    if arg.startswith('https://'):
+        assert arg == 'https://github.com/acme/action.git', arg
+        with open(os.environ['GIT_REQUEST_LOG'], 'a') as log:
+            log.write(json.dumps(args) + '\\n')
+        if os.environ.get('FAIL_FETCH'):
+            sys.exit(1)
+        if os.environ.get('GITHUB_TOKEN'):
+            helper = os.environ['GIT_ASKPASS']
+            assert os.environ['GITHUB_TOKEN'] not in pathlib.Path(helper).read_text()
+            for prompt, expected in [('Username', 'x-access-token'),
+                                     ('Password', os.environ['GITHUB_TOKEN'])]:
+                assert subprocess.check_output([helper, prompt], text=True).strip() == expected
+        args[i] = os.environ['REVIEW_REPOSITORY']
+os.execv(os.environ['REAL_GIT'], ['git', *args])
+'''
 
 
 class PinghaTests(unittest.TestCase):
@@ -60,6 +81,218 @@ class PinghaTests(unittest.TestCase):
     def requests(self):
         log = self.root / 'requests'
         return log.read_text().splitlines() if log.exists() else []
+
+    def git(self, *args, input=None):
+        return subprocess.run([self.env['REAL_GIT'], '-C', str(self.upstream), *args],
+                              env=self.env, input=input, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def review_repository(self):
+        self.upstream = self.root / 'upstream'
+        self.upstream.mkdir()
+        self.env.update(REAL_GIT=shutil.which('git'),
+                        REVIEW_REPOSITORY=str(self.upstream),
+                        GIT_REQUEST_LOG=str(self.root / 'git-requests'),
+                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
+                        GIT_AUTHOR_NAME='Action author', GIT_AUTHOR_EMAIL='author@example.test',
+                        GIT_COMMITTER_NAME='Action committer', GIT_COMMITTER_EMAIL='committer@example.test')
+        self.git('init', '--quiet', '--template=')
+        (self.upstream / 'action.yml').write_text('name: old action\n')
+        self.base = self.review_commit('Initial version')
+        self.responses['acme/action/commits/v1'] = [200, {'sha': self.base}]
+        (self.bin / 'git').write_text(GIT)
+        (self.bin / 'git').chmod(0o755)
+
+    def review_commit(self, message):
+        self.git('add', '--all')
+        self.git('commit', '--quiet', '-m', message)
+        sha = self.git('rev-parse', 'HEAD')
+        self.responses[TAGS] = [200, [{'name': 'v2', 'commit': {'sha': sha}}]]
+        return sha
+
+    def git_requests(self):
+        log = self.root / 'git-requests'
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_review_full_history_and_diff_use_the_pin_not_the_comment(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        middle = self.review_commit('Update action\n\nDetailed commit explanation.')
+        (self.upstream / 'dist').mkdir()
+        (self.upstream / 'dist/index.js').write_text('console.log("changed runtime");\n')
+        (self.upstream / 'binary').write_bytes(b'\x00\x01\xff')
+        head = self.review_commit('Update bundled runtime')
+        # A stale comment or moved tag must not replace the actual installed SHA.
+        self.responses['acme/action/commits/v1'] = [200, {'sha': head}]
+        source = f'- uses: acme/action/init@{self.base.upper()} # v1\r\n'
+        path = self.write(source)
+        path.chmod(0o640)
+        result = self.run_tool('--review')
+        self.assertEqual(path.read_bytes(), source.encode())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.requests(), [TAGS])
+        self.assertEqual(len(self.git_requests()), 1)
+        self.assertEqual(self.git_requests()[0][-1], head)
+        self.assertIn(f'{self.base}..{head}', result.stdout)
+        self.assertIn(f'commit {middle}', result.stdout)
+        self.assertIn(f'commit {head}', result.stdout)
+        self.assertIn('Detailed commit explanation.', result.stdout)
+        self.assertIn('Action author <author@example.test>', result.stdout)
+        self.assertIn('-name: old action', result.stdout)
+        self.assertIn('+name: new action', result.stdout)
+        self.assertIn('diff --git a/dist/index.js b/dist/index.js', result.stdout)
+        self.assertIn('GIT binary patch', result.stdout)
+        self.assertNotIn('WARNING', result.stdout)
+
+    def test_review_deduplicates_ranges_and_authenticates_without_saving_token(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        self.review_commit('New release')
+        self.env['GITHUB_TOKEN'] = 'test-secret-token'
+        source = ('- uses: acme/action/init@v1\n- uses: acme/action/init@v1\n'
+                  f'- uses: ACME/action/other@{self.base}\n')
+        self.write(source)
+        result = self.run_tool('-r', '-r')
+        self.assertEqual(result.stdout.count('Review:'), 2)
+        self.assertEqual(result.stdout.count('Full diff'), 1)
+        self.assertIn('already reviewed above', result.stdout)
+        self.assertEqual(self.requests(), [TAGS, 'acme/action/commits/v1'])
+        self.assertEqual(len(self.git_requests()), 1)
+        self.assertNotIn(self.env['GITHUB_TOKEN'], result.stdout + result.stderr + str(self.git_requests()))
+
+    def test_review_runs_before_update_regardless_of_option_order(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        head = self.review_commit('New release')
+        path = self.write('- uses: acme/action@v1\n')
+        result = self.run_tool('-u', '-r', '-i')
+        self.assertEqual(path.read_text(), f'- uses: acme/action@{head} # v2\n')
+        self.assertLess(result.stdout.index('Full diff'), result.stdout.index('.github/workflows/ci.yml:'))
+        self.assertIn('up to date', result.stdout)
+        self.assertEqual(self.requests(), [TAGS, 'acme/action/commits/v1'])
+
+    def test_review_fetch_failure_is_cached_and_prevents_all_mutations(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        self.review_commit('New release')
+        self.env['FAIL_FETCH'] = '1'
+        source = '- uses: acme/action/init@v1\n- uses: acme/action/other@v1\n'
+        path = self.write(source)
+        result = self.run_tool('-u', '-d', '-r', code=1)
+        self.assertEqual(path.read_text(), source)
+        self.assertFalse((self.root / '.github/dependabot.yml').exists())
+        self.assertIn('incomplete review', result.stderr)
+        self.assertEqual(len(self.git_requests()), 1)
+
+    def test_review_failed_lookups_prevent_updates(self):
+        for endpoint in (TAGS, 'acme/action/commits/v1'):
+            with self.subTest(endpoint=endpoint):
+                original = self.responses.get(endpoint)
+                self.responses[endpoint] = [404, {'message': 'Not Found'}]
+                path = self.write('- uses: acme/action@v1\n')
+                self.run_tool('-u', '-r', code=1)
+                self.assertEqual(path.read_text(), '- uses: acme/action@v1\n')
+                if original is None:
+                    del self.responses[endpoint]
+                else:
+                    self.responses[endpoint] = original
+
+    def test_review_diff_failure_prevents_updates(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        self.review_commit('New release')
+        self.env['FAIL_DIFF'] = '1'
+        path = self.write('- uses: acme/action@v1\n')
+        result = self.run_tool('-u', '-r', code=1)
+        self.assertIn('incomplete review', result.stderr)
+        self.assertEqual(path.read_text(), '- uses: acme/action@v1\n')
+
+    def test_review_isolates_git_paths_and_does_not_run_external_diff(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: new action\n')
+        self.review_commit('New release')
+        self.write('- uses: acme/action@v1\n')
+        self.env.update(GIT_DIR=str(self.upstream / '.git'),
+                        GIT_COMMON_DIR=str(self.upstream / '.git'),
+                        GIT_WORK_TREE=str(self.upstream),
+                        GIT_INDEX_FILE=str(self.upstream / '.git/index'),
+                        GIT_OBJECT_DIRECTORY=str(self.upstream / '.git/objects'),
+                        GIT_EXTERNAL_DIFF='false')
+        before = {path: path.read_bytes() for path in self.upstream.rglob('*') if path.is_file()}
+        result = self.run_tool('-r')
+        after = {path: path.read_bytes() for path in self.upstream.rglob('*') if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertIn('-name: old action', result.stdout)
+        self.assertIn('+name: new action', result.stdout)
+
+    def test_review_up_to_date_does_not_fetch_git(self):
+        self.responses['acme/action/commits/stable'] = [200, {'sha': NEW}]
+        self.write(f'- uses: acme/action@{NEW}\n- uses: acme/action@stable\n')
+        result = self.run_tool('-r')
+        self.assertEqual(result.stdout.count('Up to date; no changes.'), 2)
+        self.assertEqual(self.git_requests(), [])
+
+    def test_review_diverged_history_includes_removed_commits_and_exact_tree_diff(self):
+        self.review_repository()
+        (self.upstream / 'old-only.txt').write_text('old branch content\n')
+        old = self.review_commit('Current branch only')
+        self.git('checkout', '--quiet', '-b', 'different', self.base)
+        (self.upstream / 'new-only.txt').write_text('new branch content\n')
+        head = self.review_commit('New branch only')
+        self.write(f'- uses: acme/action@{old} # v1\n')
+        result = self.run_tool('-r')
+        self.assertIn('WARNING: latest tag does not descend', result.stdout)
+        self.assertIn('Current branch only', result.stdout)
+        self.assertIn('New branch only', result.stdout)
+        self.assertIn('-old branch content', result.stdout)
+        self.assertIn('+new branch content', result.stdout)
+        self.assertEqual([request[-1] for request in self.git_requests()], [head, old])
+
+    def test_review_rewind_shows_removed_commits(self):
+        self.review_repository()
+        (self.upstream / 'action.yml').write_text('name: newer action\n')
+        old = self.review_commit('Commit removed by update')
+        self.responses[TAGS] = [200, [{'name': 'v2', 'commit': {'sha': self.base}}]]
+        self.write(f'- uses: acme/action@{old}\n')
+        result = self.run_tool('-r')
+        self.assertIn('WARNING', result.stdout)
+        self.assertIn('Commit removed by update', result.stdout)
+        self.assertIn('-name: newer action', result.stdout)
+        self.assertIn('+name: old action', result.stdout)
+
+    def test_review_exceeds_api_commit_and_file_limits(self):
+        self.review_repository()
+        stream = []
+        for index in range(1, 252):
+            message = f'Release change {index}\n'
+            stream.append(f'commit refs/heads/release\n'
+                          f'committer Author <author@example.test> {1700000000 + index} +0000\n'
+                          f'data {len(message)}\n{message}')
+            if index == 1:
+                stream.append(f'from {self.base}\n')
+            if index == 251:
+                for file_index in range(301):
+                    stream.append(f'M 100644 inline file-{file_index}.txt\ndata 4\nnew\n')
+            stream.append('\n')
+        self.git('fast-import', '--quiet', input=''.join(stream))
+        head = self.git('rev-parse', 'release')
+        self.responses[TAGS] = [200, [{'name': 'v2', 'commit': {'sha': head}}]]
+        self.write(f'- uses: acme/action@{self.base}\n')
+        result = self.run_tool('-r')
+        self.assertEqual(sum(line.startswith('commit ') for line in result.stdout.splitlines()), 251)
+        self.assertEqual(result.stdout.count('diff --git '), 301)
+        self.assertIn('Release change 1\n', result.stdout)
+        self.assertIn('Release change 251\n', result.stdout)
+
+    def test_review_requires_git_before_any_mutation(self):
+        empty_bin = self.root / 'empty-bin'
+        empty_bin.mkdir()
+        for command in ('cat', 'jq', 'curl'):
+            (empty_bin / command).symlink_to(shutil.which(command))
+        self.env['PATH'] = str(empty_bin)
+        result = self.run_tool('-d', '-r', code=1)
+        self.assertIn('required command not found: git', result.stderr)
+        self.assertFalse((self.root / '.github/dependabot.yml').exists())
 
     def test_subactions_quotes_comments_and_cache(self):
         source = (f'  - uses: "acme/action/init@v1" # v1 keep this\r\n'

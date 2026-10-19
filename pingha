@@ -8,26 +8,34 @@ Usage: pingha [options]
   -p, --pin          Pin actions to their current ref's commit SHA.
   -u, --update       Pin actions to the latest tag returned by GitHub.
   -i, --info         Show actions, current versions, pin and update status.
+  -r, --review       Show all commits and the full diff to the latest tag.
   -d, --dependabot   Create a GitHub Actions Dependabot configuration.
   -h, --help         Show this help.
-Environment: GITHUB_TOKEN (API authentication), NO_COLOR (disable colors).
+Environment: GITHUB_TOKEN (GitHub authentication), NO_COLOR (disable colors).
 Lookups, including failures, are cached for the duration of each invocation.
+Review requires git, runs before other modes, and does not change workflows.
+When combined with --update, a failed review prevents updates.
 EOF
 }
 
 modes=
+review_requested=false
 for option do
     case "$option" in
         -p|--pin) modes="$modes pin" ;;
         -u|--update) modes="$modes update" ;;
         -i|--info) modes="$modes info" ;;
+        -r|--review) review_requested=true ;;
         -d|--dependabot) modes="$modes dependabot" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'Unknown option: %s\n' "$option" >&2; exit 1 ;;
     esac
 done
+if "$review_requested"; then modes=" review$modes"; fi
 [ -n "$modes" ] || { usage; exit 0; }
-for dependency in jq curl; do
+dependencies='jq curl'
+if "$review_requested"; then dependencies="$dependencies git"; fi
+for dependency in $dependencies; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'pingha: required command not found: %s\n' "$dependency" >&2; exit 1;
     }
@@ -41,6 +49,14 @@ if [ -z "${NO_COLOR+x}" ] && { [ -t 1 ] || [ "${CLICOLOR_FORCE:-0}" != 0 ]; }; t
     red=$(printf '\033[31m'); green=$(printf '\033[32m'); reset=$(printf '\033[0m')
 fi
 
+cache_entry() (
+    key=$(printf '%s' "$1" | cksum | tr ' ' -)
+    entry=$cache/$key
+    while [ -f "$entry.key" ] && [ "$(cat "$entry.key")" != "$1" ]; do entry=$entry.x; done
+    printf '%s' "$1" > "$entry.key"
+    printf '%s\n' "$entry"
+)
+
 # Cache resolved values and failures; subshell variables cannot clobber the caller.
 resolve() (
     repo=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -50,10 +66,7 @@ resolve() (
         ref=$(printf '%s' "$2" | jq -sRr @uri)
         endpoint="$repo/commits/$ref"; filter='[.sha]'
     fi
-    key=$(printf '%s' "$endpoint" | cksum | tr ' ' -)
-    entry=$cache/$key
-    while [ -f "$entry.key" ] && [ "$(cat "$entry.key")" != "$endpoint" ]; do entry=$entry.x; done
-    printf '%s' "$endpoint" > "$entry.key"
+    entry=$(cache_entry "$endpoint")
     [ ! -f "$entry.failed" ] || return 1
     if [ ! -f "$entry" ]; then
         [ ! -f "$cache/limited" ] || return 1
@@ -71,6 +84,65 @@ resolve() (
         fi
     fi
     cat "$entry"
+)
+
+# Fetch immutable commits without checking out or running action code. Using Git
+# avoids API limits and compares the actual trees even when histories diverge.
+review() (
+    # A caller running from a Git hook may have exported its repository paths.
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+        GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_SHALLOW_FILE
+    repo=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    range=$(cache_entry "review:$repo:$2:$3")
+    if [ -f "$range.done" ]; then
+        printf 'Same repository and commit range already reviewed above.\n'; return 0
+    fi
+    entry=$(cache_entry "git:$repo")
+    review_git() {
+        git --no-pager --git-dir="$entry.git" -c core.hooksPath=/dev/null \
+            -c color.ui=false -c log.showSignature=false "$@"
+    }
+    export GIT_TERMINAL_PROMPT=0 LC_ALL=C
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        cat > "$cache/askpass" <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\n' x-access-token ;;
+    *Password*) printf '%s\n' "$GITHUB_TOKEN" ;;
+    *) exit 1 ;;
+esac
+EOF
+        chmod 700 "$cache/askpass" || return 1
+        GIT_ASKPASS=$cache/askpass; export GIT_ASKPASS
+    fi
+    if [ ! -d "$entry.git" ]; then
+        review_git init --bare --quiet --template= || return 1
+    fi
+    # Fetch the new commit first; its history normally contains the old commit.
+    for commit in "$3" "$2"; do
+        [ ! -f "$entry.$commit.failed" ] || return 1
+        if ! review_git cat-file -e "$commit^{commit}" 2>/dev/null; then
+            if ! review_git -c credential.helper= fetch --quiet --no-tags --no-recurse-submodules \
+                "https://github.com/$repo.git" "$commit"; then
+                touch "$entry.$commit.failed"; return 1
+            fi
+        fi
+    done
+    printf 'Compare: https://github.com/%s/compare/%s..%s\n' "$repo" "$2" "$3"
+    if review_git merge-base --is-ancestor "$2" "$3"; then
+        :
+    else
+        status=$?; [ "$status" -eq 1 ] || return 1
+        printf '\nWARNING: latest tag does not descend from the current commit.\n'
+        printf 'Commits removed from the current history:\n'
+        review_git log --reverse --topo-order --format=fuller --no-notes "$3..$2" -- || return 1
+    fi
+    printf '\nCommits added since the current reference:\n'
+    review_git log --reverse --topo-order --format=fuller --no-notes "$2..$3" -- || return 1
+    printf '\nFull diff (current commit -> latest tag):\n'
+    review_git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none \
+        --binary --full-index --stat --patch "$2" "$3" -- || return 1
+    touch "$range.done"
 )
 
 # Scan and rewrite only scalar uses: lines, skipping YAML block strings.
@@ -130,7 +202,7 @@ for mode in $modes; do
             pinned=false; color=$red; state=unpinned
             if printf '%s\n' "$ref" | grep -Eq '^[a-fA-F0-9]{40}$'; then pinned=true; color=$green; state=pinned; fi
             [ "$mode:$pinned" != pin:true ] || continue
-            if [ "$mode" = info ]; then
+            if [ "$mode" = info ] || [ "$mode" = review ]; then
                 grep -Fxq -e "$action" "$cache/seen" && continue
                 printf '%s\n' "$action" >> "$cache/seen"
             fi
@@ -138,12 +210,23 @@ for mode in $modes; do
             if result=$(resolve "$repo" "$target"); then
                 sha=${result%%[[:space:]]*}; tag=${result#*"$(printf '\t')"}; [ "$mode" != pin ] || tag=$ref
                 current=$(printf '%s' "$ref" | tr '[:upper:]' '[:lower:]')
-                if [ "$mode" = info ]; then
+                if [ "$mode" = info ] || [ "$mode" = review ]; then
                     if ! "$pinned"; then
                         if [ "$ref" = "$tag" ]; then current=$sha; else current=$(resolve "$repo" "$ref") || { current=unknown; touch "$cache/failed"; }; fi
                     fi
                     next="update to $tag"; [ "$current" != "$sha" ] || next='up to date'
                     [ "$current" != unknown ] || next=unknown
+                    if [ "$mode" = review ]; then
+                        printf '\nReview: %s -> %s (%s)\n' "$action${comment:+ $comment}" "$tag" "$sha"
+                        if [ "$current" = unknown ]; then
+                            printf 'Review unavailable: could not resolve the current reference.\n'
+                        elif [ "$current" = "$sha" ]; then
+                            printf 'Up to date; no changes.\n'
+                        elif ! review "$repo" "$current" "$sha"; then
+                            printf 'pingha: incomplete review for %s (%s -> %s)\n' "$repo" "$current" "$sha" >&2
+                            touch "$cache/failed"
+                        fi
+                    fi
                 elif [ "$current" != "$sha" ]; then
                     printf '%s\t%s\t%s\n' "$number" "$sha" "$tag" >> "$cache/edits"
                     printf '%s: %s -> %s (%s)\n' "$file" "$action" "$tag" "$sha"
@@ -164,5 +247,6 @@ for mode in $modes; do
             pending=
         fi
     done
+    if [ "$mode" = review ] && [ -f "$cache/failed" ]; then exit 1; fi
 done
 [ ! -f "$cache/failed" ]
